@@ -45,8 +45,8 @@
     ],
     "demo": [],
     "test": [],
-    "installable": True,
-    "auto_install": ["l10n_ar"],
+    "installable": False,
+    "auto_install": False,
     "application": False,
     "post_init_hook": "l10n_ar_account_tax_settlement_post_init_hook",
 }
