@@ -192,7 +192,7 @@ class AccountReturn(models.Model):
         This method detects that case and rebuilds the closing move with the correct lines
         calculated directly from account.move.line records matching the activity domain.
         """
-        for closing_move in self.closing_move_ids.filtered(lambda m: m.state == "draft"):
+        for closing_move in self.closing_move_ids:
             # Check if the closing move has the "bad placeholder" pattern:
             # lines with $0 balance and names like "Ajuste de impuesto"
             non_zero_tax_lines = closing_move.line_ids.filtered(
@@ -255,6 +255,11 @@ class AccountReturn(models.Model):
                     "credit": -total if total < 0 else 0.0,
                     "partner_id": partner.id,
                 }))
+
+            # If move was already posted, reset to draft to allow line changes
+            was_posted = closing_move.state == "posted"
+            if was_posted:
+                closing_move.button_draft()
 
             # Replace all lines on the closing move
             closing_move.line_ids = [Command.clear()] + new_lines
