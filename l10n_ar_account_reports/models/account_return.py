@@ -154,6 +154,11 @@ class AccountReturn(models.Model):
         For Argentinian provincial tax returns (Ingresos Brutos), we handle the locking process differently.
         We don't want to set the tax_lock_date when validating the "asiento de liquidación".
         We temporarily store the current tax_lock_date, call super(), then restore it to prevent changes.
+
+        Additionally, for simple closing returns (SICORE, ARBA, SIFERE, etc.), the base module's
+        closing entry generation may produce incorrect placeholder lines when the report uses
+        domain-based expressions instead of standard VAT tax group expressions. We detect this
+        case and rebuild the closing move lines using the actual tax data from account.move.line.
         """
         tax_lock_dates = {
             company: company.tax_lock_date for company in self.company_ids.filtered(lambda c: c.country_id.code == "AR")
@@ -171,10 +176,88 @@ class AccountReturn(models.Model):
                 if company.tax_lock_date != original_date:
                     company.sudo().tax_lock_date = original_date
 
+            # Fix closing move lines if the base module generated placeholders with $0
+            self._fix_simple_closing_move_lines()
+
         # si no posteamos devolvemos acción
         if self.closing_move_ids.filtered(lambda m: m.state == "draft"):
             return self.closing_move_ids._get_records_action()
         return res
+
+    def _fix_simple_closing_move_lines(self):
+        """For Argentine simple closing returns, the base Odoo Enterprise module may generate
+        placeholder closing lines with $0 and incorrect accounts when the report uses domain-based
+        expressions (e.g., SICORE, ARBA, SIFERE) instead of standard VAT tax group expressions.
+
+        This method detects that case and rebuilds the closing move with the correct lines
+        calculated directly from account.move.line records matching the activity domain.
+        """
+        for closing_move in self.closing_move_ids.filtered(lambda m: m.state == "draft"):
+            # Check if the closing move has the "bad placeholder" pattern:
+            # lines with $0 balance and names like "Ajuste de impuesto"
+            non_zero_tax_lines = closing_move.line_ids.filtered(
+                lambda l: not closing_move.currency_id.is_zero(l.balance)
+                and l.partner_id != self.type_id.payment_partner_id
+            )
+            if non_zero_tax_lines:
+                # The base module generated proper lines — nothing to fix
+                continue
+
+            # Base module generated placeholder lines. Rebuild from actual data.
+            activity_domain = self.type_id._get_l10n_ar_activity_domain()
+            if not activity_domain:
+                continue
+
+            # Query actual tax move lines for the period
+            domain = [
+                ("company_id", "=", self.company_id.id),
+                ("parent_state", "=", "posted"),
+                ("date", ">=", self.date_from),
+                ("date", "<=", self.date_to),
+            ] + activity_domain
+
+            tax_lines = self.env["account.move.line"].sudo().search(domain)
+            if not tax_lines:
+                continue
+
+            # Group by account to build closing lines
+            amounts_by_account = {}
+            for line in tax_lines:
+                acc = line.account_id
+                amounts_by_account[acc] = amounts_by_account.get(acc, 0.0) + line.balance
+
+            currency = self.company_id.currency_id
+            total = sum(amounts_by_account.values())
+            if currency.is_zero(total):
+                continue
+
+            # Build the new line commands
+            new_lines = []
+            for account, balance in amounts_by_account.items():
+                if currency.is_zero(balance):
+                    continue
+                new_lines.append(Command.create({
+                    "name": account.name,
+                    "account_id": account.id,
+                    "debit": -balance if balance < 0 else 0.0,
+                    "credit": balance if balance > 0 else 0.0,
+                }))
+
+            # Counterpart line on the configured account (l10n_ar_account_id)
+            configured_account = self.type_id.with_company(self.company_id).l10n_ar_account_id
+            partner = self.type_id.payment_partner_id
+            if configured_account and partner:
+                counterpart_name = _("Tax to pay") if total < 0 else _("Tax credit")
+                new_lines.append(Command.create({
+                    "name": counterpart_name,
+                    "account_id": configured_account.id,
+                    "debit": total if total > 0 else 0.0,
+                    "credit": -total if total < 0 else 0.0,
+                    "partner_id": partner.id,
+                }))
+
+            # Replace all lines on the closing move
+            closing_move.line_ids = [Command.clear()] + new_lines
 
     def _run_checks(self, check_codes_to_ignore):
         # if "l10n_ar_account_reports." in self.type_external_id:
