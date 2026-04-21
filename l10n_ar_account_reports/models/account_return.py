@@ -126,7 +126,10 @@ class AccountReturn(models.Model):
             credit_account = False
             if tax_group_subtotal:
                 # Get receivable account from the first tax group that has one
-                for group in tax_group_subtotal:
+                # Keys in tax_group_subtotal can be recordsets or tuples depending on Odoo version
+                TaxGroup = self.env["account.tax.group"]
+                for group_key in tax_group_subtotal:
+                    group = TaxGroup.browse(group_key.id) if hasattr(group_key, 'id') else TaxGroup.browse(group_key[0]) if isinstance(group_key, tuple) else group_key
                     if group.tax_receivable_account_id:
                         credit_account = group.tax_receivable_account_id
                         break
