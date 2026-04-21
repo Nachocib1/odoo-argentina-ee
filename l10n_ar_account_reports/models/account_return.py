@@ -187,6 +187,11 @@ class AccountReturn(models.Model):
             # Fix closing move lines if the base module generated placeholders with $0
             self._fix_simple_closing_move_lines()
 
+            # Ensure all closing moves stay in DRAFT for AR simple closings
+            # The base module may auto-post them despite post_from_tax_return context
+            for move in self.closing_move_ids.filtered(lambda m: m.state == "posted"):
+                move.button_draft()
+
         # si no posteamos devolvemos acción
         if self.closing_move_ids.filtered(lambda m: m.state == "draft"):
             return self.closing_move_ids._get_records_action()
