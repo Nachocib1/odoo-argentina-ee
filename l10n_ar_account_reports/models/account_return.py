@@ -114,18 +114,23 @@ class AccountReturn(models.Model):
         # l10n_ar_account_id es company_dependent, aseguramos usar la compañía del return
         configured_account = self.type_id.with_company(self.company_id).l10n_ar_account_id
 
-        line_name = _("Tax to pay") if total < 0 else _("Tax credit")
-        if configured_account:
-            # Use the configured account from the return type
-            account = configured_account
+        if total < 0:
+            # Amount to pay (negative balance means we owe taxes)
+            line_name = _("Tax to pay")
+            account = configured_account or partner.with_company(self.company_id).property_account_payable_id
         else:
-            # Fallback: Use partner's payable account for amounts to pay, receivable for credits
-            if total < 0:
-                # Amount to pay (negative balance means we owe taxes)
-                account = partner.with_company(self.company_id).property_account_payable_id
-            else:
-                # Credit in favor (positive balance means tax credit)
-                account = partner.with_company(self.company_id).property_account_receivable_id
+            # Credit in favor (positive balance means tax credit)
+            # Use the receivable account from the tax groups if available (e.g., IVA Saldo Libre Disponibilidad),
+            # otherwise fall back to the configured account or partner's receivable
+            line_name = _("Tax credit")
+            credit_account = False
+            if tax_group_subtotal:
+                # Get receivable account from the first tax group that has one
+                for group in tax_group_subtotal:
+                    if group.tax_receivable_account_id:
+                        credit_account = group.tax_receivable_account_id
+                        break
+            account = credit_account or configured_account or partner.with_company(self.company_id).property_account_receivable_id
 
         if not account:
             raise UserError(
@@ -243,14 +248,31 @@ class AccountReturn(models.Model):
                     "credit": balance if balance > 0 else 0.0,
                 }))
 
-            # Counterpart line on the configured account (l10n_ar_account_id)
+            # Counterpart line: use configured account for payable, receivable account for credit
             configured_account = self.type_id.with_company(self.company_id).l10n_ar_account_id
             partner = self.type_id.payment_partner_id
-            if configured_account and partner:
-                counterpart_name = _("Tax to pay") if total < 0 else _("Tax credit")
+            if partner:
+                if total < 0:
+                    counterpart_name = _("Tax to pay")
+                    account = configured_account or partner.with_company(self.company_id).property_account_payable_id
+                else:
+                    counterpart_name = _("Tax credit")
+                    # For credit (saldo a favor), use tax group receivable account if available
+                    credit_account = False
+                    for acc_record in amounts_by_account:
+                        groups = self.env["account.tax.group"].search([
+                            ("company_id", "=", self.company_id.id),
+                            ("tax_receivable_account_id", "!=", False),
+                            ("tax_payable_account_id", "=", acc_record.id),
+                        ], limit=1)
+                        if groups and groups.tax_receivable_account_id:
+                            credit_account = groups.tax_receivable_account_id
+                            break
+                    account = credit_account or configured_account or partner.with_company(self.company_id).property_account_receivable_id
+
                 new_lines.append(Command.create({
                     "name": counterpart_name,
-                    "account_id": configured_account.id,
+                    "account_id": account.id,
                     "debit": total if total > 0 else 0.0,
                     "credit": -total if total < 0 else 0.0,
                     "partner_id": partner.id,
